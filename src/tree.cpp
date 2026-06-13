@@ -44,15 +44,6 @@ TreeNode* PaymentTree::getNode(const std::string& name) {
     return nullptr;
 }
 
-
-bool PaymentTree::unlock(const std::string& /*nodeName*/, int /*userId*/) {
-    return false;
-}
-
-bool PaymentTree::upgradeLock(const std::string& /*nodeName*/, int /*userId*/) {
-    return false;
-}
-
 std::string PaymentTree::toJson() const {
     return "{}";
 }
@@ -100,5 +91,75 @@ bool PaymentTree::lock(const std::string& nodeName, int userId) {
     return true;
 }
 
-void PaymentTree::collectLockedDescendants(TreeNode* /*node*/, int /*userId*/,
-    std::vector<TreeNode*>& /*result*/, bool& /*valid*/) {}
+bool PaymentTree::unlock(const std::string& nodeName, int userId) {
+    TreeNode* node = getNode(nodeName);
+    if (node == nullptr) return false;
+
+    // Only the user who locked it can unlock it
+    if (!node->isLocked) return false;
+    if (node->lockedBy != userId) return false;
+
+    // Clear the lock state
+    node->isLocked = false;
+    node->lockedBy = -1;
+
+    // Reverse the metadata propagation
+    informAncestors(node, -1);
+    informDescendants(node, -1);
+
+    return true;
+}
+
+void PaymentTree::collectLockedDescendants(TreeNode* node, int userId,
+    std::vector<TreeNode*>& result, bool& valid) {
+    // Recursively find all locked descendants and verify they
+    // all belong to the same userId
+    for (TreeNode* child : node->children) {
+        if (child->isLocked) {
+            if (child->lockedBy != userId) {
+                valid = false;
+                return;
+            }
+            result.push_back(child);
+        }
+        collectLockedDescendants(child, userId, result, valid);
+        if (!valid) return;
+    }
+}
+
+bool PaymentTree::upgradeLock(const std::string& nodeName, int userId) {
+    TreeNode* node = getNode(nodeName);
+    if (node == nullptr) return false;
+
+    // Target node must not already be locked
+    if (node->isLocked) return false;
+
+    // No ancestor can be locked
+    if (node->ancestorLockedCount > 0) return false;
+
+    // Must have at least one locked descendant to upgrade from
+    if (node->descendantLockedCount == 0) return false;
+
+    // Collect all locked descendants and verify they belong to this user
+    std::vector<TreeNode*> lockedDescendants;
+    bool valid = true;
+    collectLockedDescendants(node, userId, lockedDescendants, valid);
+
+    if (!valid) return false;
+
+    // Unlock all descendants (consolidating into the parent)
+    for (TreeNode* desc : lockedDescendants) {
+        desc->isLocked = false;
+        desc->lockedBy = -1;
+        informAncestors(desc, -1);
+        informDescendants(desc, -1);
+    }
+
+    // Lock the target node
+    node->isLocked = true;
+    node->lockedBy = userId;
+    informAncestors(node, 1);
+    informDescendants(node, 1);
+
+    return true;
+}
