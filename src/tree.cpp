@@ -44,10 +44,6 @@ TreeNode* PaymentTree::getNode(const std::string& name) {
     return nullptr;
 }
 
-// Stub implementations - will be completed in the next step
-bool PaymentTree::lock(const std::string& /*nodeName*/, int /*userId*/) {
-    return false;
-}
 
 bool PaymentTree::unlock(const std::string& /*nodeName*/, int /*userId*/) {
     return false;
@@ -61,9 +57,48 @@ std::string PaymentTree::toJson() const {
     return "{}";
 }
 
-void PaymentTree::informAncestors(TreeNode* /*node*/, int /*delta*/) {}
+void PaymentTree::informAncestors(TreeNode* node, int delta) {
+    // Walk up the parent chain, adjusting each ancestor's
+    // descendantLockedCount so they know a descendant changed state
+    TreeNode* current = node->parent;
+    while (current != nullptr) {
+        current->descendantLockedCount += delta;
+        current = current->parent;
+    }
+}
 
-void PaymentTree::informDescendants(TreeNode* /*node*/, int /*delta*/) {}
+void PaymentTree::informDescendants(TreeNode* node, int delta) {
+    // Recursively visit all children, adjusting their
+    // ancestorLockedCount so they know an ancestor changed state
+    for (TreeNode* child : node->children) {
+        child->ancestorLockedCount += delta;
+        informDescendants(child, delta);
+    }
+}
+
+bool PaymentTree::lock(const std::string& nodeName, int userId) {
+    TreeNode* node = getNode(nodeName);
+    if (node == nullptr) return false;
+
+    // Check 1: node must not already be locked
+    if (node->isLocked) return false;
+
+    // Check 2: no ancestor can be locked (O(1) check using counter)
+    if (node->ancestorLockedCount > 0) return false;
+
+    // Check 3: no descendant can be locked (O(1) check using counter)
+    if (node->descendantLockedCount > 0) return false;
+
+    // All checks passed - set the lock state
+    node->isLocked = true;
+    node->lockedBy = userId;
+
+    // Propagate metadata: tell ancestors and descendants about this lock
+    informAncestors(node, 1);
+    informDescendants(node, 1);
+
+    return true;
+}
 
 void PaymentTree::collectLockedDescendants(TreeNode* /*node*/, int /*userId*/,
     std::vector<TreeNode*>& /*result*/, bool& /*valid*/) {}
