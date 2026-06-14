@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Gateway Orchestration Engine</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
+        .container { display: grid; grid-template-columns: 1fr 350px; height: 100vh; }
+        .tree-panel { padding: 20px; overflow: hidden; }
+        .sidebar { background: #1a1f25; padding: 20px; overflow-y: auto; border-left: 1px solid #2f3336; }
+        h1 { font-size: 1.4rem; margin-bottom: 10px; color: #1d9bf0; }
+        h2 { font-size: 1rem; margin: 15px 0 8px; color: #8b98a5; text-transform: uppercase; letter-spacing: 1px; }
+        .metric { background: #1e2732; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+        .metric-value { font-size: 1.5rem; font-weight: bold; color: #1d9bf0; }
+        .metric-label { font-size: 0.75rem; color: #8b98a5; }
+        .node circle { stroke-width: 2px; cursor: pointer; }
+        .node text { font-size: 11px; fill: #e7e9ea; }
+        .link { fill: none; stroke: #2f3336; stroke-width: 1.5px; }
+        .btn { background: #1d9bf0; color: white; border: none; padding: 10px 20px; border-radius: 20px; cursor: pointer; font-size: 0.9rem; width: 100%; margin-top: 10px; }
+        .btn:hover { background: #1a8cd8; }
+        .log { background: #1e2732; border-radius: 8px; padding: 10px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.75rem; line-height: 1.6; }
+        .log-entry { border-bottom: 1px solid #2f3336; padding: 3px 0; }
+        .locked { fill: #f4212e; }
+        .unlocked { fill: #00ba7c; }
+        .contended { fill: #ffd400; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="tree-panel">
+            <h1>Payment Gateway Orchestration Engine</h1>
+            <svg id="tree-svg" width="100%" height="90%"></svg>
+        </div>
+        <div class="sidebar">
+            <h2>Metrics</h2>
+            <div class="metric">
+                <div class="metric-value" id="total-txn">0</div>
+                <div class="metric-label">Total Transactions</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="success-locks">0</div>
+                <div class="metric-label">Successful Locks</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="failed-locks">0</div>
+                <div class="metric-label">Failed Locks (Contention)</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" id="cas-retries">0</div>
+                <div class="metric-label">CAS Retries</div>
+            </div>
+            <button class="btn" onclick="runSimulation()">Run Concurrent Simulation (8 threads)</button>
+            <h2>Transaction Log</h2>
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+    <script>
+        const BACKEND_URL = '';
+        const DEMO_MODE = !window.location.hostname.includes('localhost') && !BACKEND_URL;
+        const DEMO_DATA = {name:"PaymentSystem",isLocked:false,children:[{name:"Cards",isLocked:false,children:[{name:"Visa",isLocked:true,children:[{name:"HDFC",isLocked:false,children:[]},{name:"ICICI",isLocked:false,children:[]}]},{name:"Mastercard",isLocked:false,children:[{name:"SBI",isLocked:true,children:[]},{name:"Axis",isLocked:false,children:[]}]},{name:"RuPay",isLocked:false,children:[{name:"PNB",isLocked:false,children:[]},{name:"BOB",isLocked:false,children:[]}]}]},{name:"UPI",isLocked:false,children:[{name:"GPay",isLocked:false,children:[]},{name:"PhonePe",isLocked:true,children:[]},{name:"BHIM",isLocked:false,children:[]}]},{name:"Wallets",isLocked:false,children:[{name:"Paytm",isLocked:false,children:[]},{name:"AmazonPay",isLocked:false,children:[]}]}]};
+
+        function apiUrl(path) { return BACKEND_URL ? BACKEND_URL + path : path; }
+
+        async function fetchTree() {
+            if (DEMO_MODE) return DEMO_DATA;
+            try { const res = await fetch(apiUrl('/api/tree')); return await res.json(); }
+            catch(e) { return DEMO_DATA; }
+        }
+        async function fetchMetrics() {
+            if (DEMO_MODE) { document.getElementById('total-txn').textContent = '847'; document.getElementById('success-locks').textContent = '612'; document.getElementById('failed-locks').textContent = '235'; document.getElementById('cas-retries').textContent = '89'; return; }
+            try {
+                const res = await fetch(apiUrl('/api/metrics'));
+                const data = await res.json();
+                document.getElementById('total-txn').textContent = data.totalTransactions;
+                document.getElementById('success-locks').textContent = data.successfulLocks;
+                document.getElementById('failed-locks').textContent = data.failedLocks;
+                document.getElementById('cas-retries').textContent = data.casRetries;
+            } catch(e) {}
+        }
+        async function runSimulation() {
+            if (DEMO_MODE) { const log = document.getElementById('log'); log.innerHTML = '<div class="log-entry">[DEMO] Simulation: 8 threads x 100 txns</div>' + log.innerHTML; return; }
+            const res = await fetch(apiUrl('/api/simulate'), { method: 'POST' });
+            const data = await res.json();
+            const log = document.getElementById('log');
+            log.innerHTML = '<div class="log-entry">Simulation complete: ' + data.threads + ' threads x ' + data.txnPerThread + ' txns</div>' + log.innerHTML;
+            fetchMetrics();
+            renderTree();
+        }
+        async function renderTree() {
+            const data = await fetchTree();
+            const svg = d3.select('#tree-svg');
+            svg.selectAll('*').remove();
+            const width = svg.node().getBoundingClientRect().width;
+            const height = svg.node().getBoundingClientRect().height;
+            const g = svg.append('g').attr('transform', 'translate(40,40)');
+            const root = d3.hierarchy(data);
+            const treeLayout = d3.tree().size([width - 80, height - 80]);
+            treeLayout(root);
+            g.selectAll('.link').data(root.links()).join('path')
+                .attr('class', 'link')
+                .attr('d', d3.linkVertical().x(d => d.x).y(d => d.y));
+            const nodes = g.selectAll('.node').data(root.descendants()).join('g')
+                .attr('class', 'node')
+                .attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+            nodes.append('circle').attr('r', 8)
+                .attr('class', d => d.data.isLocked ? 'locked' : 'unlocked');
+            nodes.append('text').attr('dy', -12).attr('text-anchor', 'middle')
+                .text(d => d.data.name);
+        }
+        renderTree();
+        fetchMetrics();
+        if (!DEMO_MODE) setInterval(fetchMetrics, 1000);
+    </script>
+</body>
+</html>
