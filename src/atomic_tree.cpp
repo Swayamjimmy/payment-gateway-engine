@@ -55,3 +55,71 @@ void AtomicPaymentTree::informDescendantsAtomic(AtomicTreeNode* node, int delta)
         informDescendantsAtomic(child, delta);
     }
 }
+
+// Lock-free lock using CAS retry loop
+bool AtomicPaymentTree::lock(const std::string& nodeName, int userId) {
+    AtomicTreeNode* node = getNode(nodeName);
+    if (!node) return false;
+
+    // Check if any ancestor is locked (atomic read with acquire semantics)
+    if (node->ancestorLockedCount.load(std::memory_order_acquire) > 0) {
+        return false;
+    }
+
+    // Check if any descendant is locked
+    if (node->descendantLockedCount.load(std::memory_order_acquire) > 0) {
+        return false;
+    }
+
+    // CAS loop: atomically set lockState from 0 (unlocked) to 1 (locked)
+    int expected = 0;
+    while (!node->lockState.compare_exchange_weak(expected, 1,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        if (expected != 0) {
+            // Node is already locked by someone else
+            return false;
+        }
+        // Spurious failure - reset expected and retry
+        metrics.casRetries.fetch_add(1, std::memory_order_relaxed);
+        expected = 0;
+    }
+
+    // Re-validate after CAS success (another thread may have locked an ancestor/descendant)
+    if (node->ancestorLockedCount.load(std::memory_order_acquire) > 0 ||
+        node->descendantLockedCount.load(std::memory_order_acquire) > 0) {
+        // Rollback: release the lock we just acquired
+        node->lockState.store(0, std::memory_order_release);
+        return false;
+    }
+
+    // Lock acquired successfully - record owner and propagate counts
+    node->lockedBy.store(userId, std::memory_order_release);
+    informAncestorsAtomic(node, 1);
+    informDescendantsAtomic(node, 1);
+    return true;
+}
+
+// Lock-free unlock: CAS clears lock only if the userId matches
+bool AtomicPaymentTree::unlock(const std::string& nodeName, int userId) {
+    AtomicTreeNode* node = getNode(nodeName);
+    if (!node) return false;
+
+    // Verify the node is locked by this user (atomic read)
+    if (node->lockedBy.load(std::memory_order_acquire) != userId) {
+        return false;
+    }
+
+    // CAS to clear lock state from 1 to 0
+    int expected = 1;
+    if (!node->lockState.compare_exchange_weak(expected, 0,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        metrics.casRetries.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Clear ownership and propagate count decrements
+    node->lockedBy.store(-1, std::memory_order_release);
+    informAncestorsAtomic(node, -1);
+    informDescendantsAtomic(node, -1);
+    return true;
+}
