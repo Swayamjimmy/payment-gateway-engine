@@ -99,27 +99,108 @@ bool AtomicPaymentTree::lock(const std::string& nodeName, int userId) {
     return true;
 }
 
-// Lock-free unlock: CAS clears lock only if the userId matches
 bool AtomicPaymentTree::unlock(const std::string& nodeName, int userId) {
     AtomicTreeNode* node = getNode(nodeName);
     if (!node) return false;
 
-    // Verify the node is locked by this user (atomic read)
+    // 1. Verify ownership
     if (node->lockedBy.load(std::memory_order_acquire) != userId) {
         return false;
     }
 
-    // CAS to clear lock state from 1 to 0
+    // 2. Clear ownership first
+    node->lockedBy.store(-1, std::memory_order_release);
+
+    // 3. FIX: Use compare_exchange_strong to prevent spurious failures
     int expected = 1;
-    if (!node->lockState.compare_exchange_weak(expected, 0,
+    if (!node->lockState.compare_exchange_strong(expected, 0,
             std::memory_order_release, std::memory_order_relaxed)) {
+        // Rollback ownership in the highly unlikely event of an actual CAS failure
+        node->lockedBy.store(userId, std::memory_order_release);
         metrics.casRetries.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
-    // Clear ownership and propagate count decrements
-    node->lockedBy.store(-1, std::memory_order_release);
+    // 4. Propagate counts
     informAncestorsAtomic(node, -1);
     informDescendantsAtomic(node, -1);
     return true;
+}
+
+bool AtomicPaymentTree::upgradeLock(const std::string& nodeName, int userId) {
+    AtomicTreeNode* node = getNode(nodeName);
+    if (!node) return false;
+
+    // Node must not already be locked
+    if (node->lockState.load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+
+    // No ancestor can be locked
+    if (node->ancestorLockedCount.load(std::memory_order_acquire) > 0) {
+        return false;
+    }
+
+    // BFS to collect locked descendants
+    std::vector<AtomicTreeNode*> lockedDescendants;
+    std::queue<AtomicTreeNode*> bfs;
+    for (auto* child : node->children) {
+        bfs.push(child);
+    }
+    while (!bfs.empty()) {
+        AtomicTreeNode* current = bfs.front();
+        bfs.pop();
+        if (current->lockState.load(std::memory_order_acquire) == 1) {
+            if (current->lockedBy.load(std::memory_order_acquire) != userId) {
+                return false; 
+            }
+            lockedDescendants.push_back(current);
+        }
+        for (auto* child : current->children) {
+            bfs.push(child);
+        }
+    }
+
+    if (lockedDescendants.empty()) {
+        return false;
+    }
+
+    // Unlock descendants
+    for (auto* desc : lockedDescendants) {
+        desc->lockState.store(0, std::memory_order_release);
+        desc->lockedBy.store(-1, std::memory_order_release);
+        informAncestorsAtomic(desc, -1);
+        informDescendantsAtomic(desc, -1);
+    }
+
+    // FIX: Use compare_exchange_strong here as well
+    int expected = 0;
+    if (!node->lockState.compare_exchange_strong(expected, 1,
+            std::memory_order_release, std::memory_order_relaxed)) {
+        return false;
+    }
+
+    node->lockedBy.store(userId, std::memory_order_release);
+    informAncestorsAtomic(node, 1);
+    informDescendantsAtomic(node, 1);
+    return true;
+}
+
+// Serialize tree state to JSON for the frontend
+std::string AtomicPaymentTree::toJson() const {
+    if (!root) return "{}";
+
+    std::function<std::string(AtomicTreeNode*)> serialize = [&](AtomicTreeNode* node) -> std::string {
+        std::string json = "{\"name\":\"" + node->name + "\",\"isLocked\":" +
+            (node->lockState.load(std::memory_order_acquire) == 1 ? "true" : "false") +
+            ",\"children\":[";
+        for (size_t i = 0; i < node->children.size(); i++) {
+            if (i > 0) json += ",";
+            json += serialize(node->children[i]);
+        }
+        json += "]}";
+        return json;
+    };
+
+    return serialize(root);
 }
